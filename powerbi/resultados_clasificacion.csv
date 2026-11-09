@@ -1,0 +1,6 @@
+﻿Modelo,Exactitud (accuracy),F1 macro,AUC (uno vs. resto),Herramienta,Tarea
+Gradient Boosting,0.5866,0.5814,0.866,Python,Clasificación de género
+Random Forest,0.5823,0.5758,0.8667,Python,Clasificación de género
+Árbol de decisión,0.5031,0.4992,0.8046,Python,Clasificación de género
+Regresión logística,0.4975,0.4919,0.8088,Python,Clasificación de género
+Naive Bayes,0.4764,0.4709,0.7963,Python,Clasificación de género

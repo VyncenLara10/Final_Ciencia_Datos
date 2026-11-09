@@ -1,0 +1,7 @@
+Modelo,RMSE,MAE,R2,Herramienta,Tarea,AUC
+Gradient Boosting,18.8063,15.1912,0.1624,R,Regresión de popularidad,
+Random Forest,18.9853,15.3446,0.1464,R,Regresión de popularidad,
+Regresión lineal,19.5487,15.8413,0.095,R,Regresión de popularidad,
+Base (media),20.5489,16.8461,-0,R,Regresión de popularidad,
+Regresión logística,,,,R,Clasificación de éxito (popularidad >= 70),0.7226
+Random Forest,,,,R,Clasificación de éxito (popularidad >= 70),0.7572

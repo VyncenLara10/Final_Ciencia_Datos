@@ -1,0 +1,509 @@
+---
+title: "Ciencia de Datos aplicada a 30,000 canciones de Spotify"
+subtitle: "Parte 2: inferencia estadística y modelos de popularidad (R)"
+author: "Grupo 5"
+date: "2026-11-05"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 4.8, dpi = 120)
+library(tidyverse)
+library(rsample)
+library(ranger)
+library(gbm)
+library(pROC)
+library(knitr)
+library(scales)
+library(patchwork)
+
+# Configuraciones
+options(scipen = 999, knitr.kable.NA = "—", dplyr.summarise.inform = FALSE)
+theme_set(theme_minimal(base_size = 11) +
+            theme(plot.title = element_text(face = "bold"),
+                  panel.grid.minor = element_blank()))
+SEMILLA <- 42
+
+# Un color fijo por género (el mismo que en la Parte 1)
+colores_genero <- c(edm = "#2a78d6", latin = "#eb6834", pop = "#1baf7a",
+                    `r&b` = "#eda100", rap = "#e87ba4", rock = "#008300")
+AZUL <- "#2a78d6"; NARANJA <- "#eb6834"; GRIS <- "#8a8984"
+
+# Formato de números para el texto
+fmt <- function(x, d = 2) format(round(x, d), nsmall = d, big.mark = ",")
+pval <- function(p) ifelse(p < 0.001, "< 0.001", fmt(p, 3))
+tabla <- function(df, d = 2, ...) kable(df, digits = d, format.args = list(big.mark = ","), ...)
+
+AUDIO <- c("danceability", "energy", "loudness", "speechiness", "acousticness",
+           "instrumentalness", "liveness", "valence", "tempo", "duracion_min")
+```
+
+## Información general
+
+**Objetivo:** responder con estadística inferencial y modelos predictivos la pregunta que quedó abierta en la Parte 1: **¿qué explica la popularidad de una canción en Spotify?**
+
+**Datos:** la misma base *30,000 Spotify Songs* (TidyTuesday, 2020). En esta parte se vuelve a ejecutar la limpieza en R, se verifica que dé exactamente el mismo resultado que en Python y se agregan los clusters calculados en la Parte 1.
+
+**Herramientas:** `tidyverse` para manipular y graficar, `rsample` para dividir los datos, `ranger` (Random Forest), `gbm` (Gradient Boosting) y `pROC` (curvas ROC).
+
+---
+
+## Parte A: Limpieza en R y verificación contra Python
+
+Se aplican exactamente las mismas reglas de la Parte 1:
+
+1. Eliminar las filas sin nombre ni artista.
+2. Ordenar por popularidad de mayor a menor y quedarse con la primera aparición de cada `track_id` y luego de cada combinación nombre + artista.
+3. Convertir la popularidad 0 en faltante (`NA`), porque es un nulo disfrazado.
+4. Crear año, década y duración en minutos.
+
+```{r limpieza}
+crudo <- read_csv("data/spotify_songs.csv", show_col_types = FALSE)
+
+spotify_r <- crudo %>%
+  filter(!is.na(track_name), !is.na(track_artist)) %>%
+  arrange(desc(track_popularity)) %>%            # arrange() es estable, igual que en pandas
+  distinct(track_id, .keep_all = TRUE) %>%
+  distinct(track_name, track_artist, .keep_all = TRUE) %>%
+  mutate(popularidad  = na_if(track_popularity, 0),
+         anio         = as.integer(str_sub(track_album_release_date, 1, 4)),
+         decada       = paste0(anio %/% 10 * 10, "s"),
+         duracion_min = duration_ms / 60000)
+
+# Base exportada por Python (trae además los clusters de la Parte 1)
+spotify_py <- read_csv("data/spotify_limpio.csv", show_col_types = FALSE)
+
+verificacion <- tibble(
+  Comprobación = c("Filas en la base cruda", "Canciones después de limpiar (R)",
+                   "Canciones después de limpiar (Python)", "¿Mismas canciones en R y Python?",
+                   "Canciones con popularidad faltante (R)"),
+  Resultado = c(fmt(nrow(crudo), 0), fmt(nrow(spotify_r), 0), fmt(nrow(spotify_py), 0),
+                ifelse(setequal(spotify_r$track_id, spotify_py$track_id), "Sí", "No"),
+                fmt(sum(is.na(spotify_r$popularidad)), 0))
+)
+tabla(verificacion)
+
+# Base de trabajo: limpieza de R + cluster de Python
+spotify <- spotify_r %>%
+  left_join(spotify_py %>% select(track_id, nombre_cluster), by = "track_id") %>%
+  mutate(genero = factor(playlist_genre, levels = names(colores_genero)),
+         modo   = factor(if_else(mode == 1, "Mayor", "Menor")))
+con_pop <- spotify %>% filter(!is.na(popularidad))
+```
+
+La limpieza en R produce las mismas **`r fmt(nrow(spotify), 0)` canciones** que en Python. Para todo lo relacionado con popularidad se usan las **`r fmt(nrow(con_pop), 0)` canciones con popularidad conocida**.
+
+---
+
+## Parte B: Distribución de frecuencias de la popularidad
+
+### B.1 Tabla de distribución de frecuencias (datos agrupados)
+
+El número de clases se calcula con la regla de Sturges, $k = 1 + 3.322 \log_{10}(n)$, y la amplitud con $A = \text{Rango} / k$, redondeada hacia arriba.
+
+```{r tabla-frecuencias}
+x <- con_pop$popularidad
+n <- length(x)
+k <- ceiling(1 + 3.322 * log10(n))
+minimo <- min(x); maximo <- max(x)
+rango <- maximo - minimo
+amplitud <- ceiling(rango / k)
+k_final <- ceiling((rango + 1) / amplitud)   # clases necesarias para cubrir del mínimo al máximo
+cortes <- seq(minimo, minimo + amplitud * k_final, by = amplitud)
+
+frecuencias <- tibble(clase = cut(x, breaks = cortes, right = FALSE, include.lowest = TRUE)) %>%
+  count(clase, .drop = FALSE, name = "fi") %>%
+  mutate(lim_inf = head(cortes, -1), lim_sup = tail(cortes, -1),
+         xi = (lim_inf + lim_sup) / 2,
+         fr = fi / n, Fi = cumsum(fi), Fr = cumsum(fr), pct = fr * 100)
+
+tabla(frecuencias %>%
+        transmute(Clase = paste0("[", lim_inf, ", ", lim_sup, ")"),
+                  `Marca de clase (xi)` = xi, `fi` = fi, `fr` = fr, `Fi` = Fi, `Fr` = Fr, `%` = pct),
+      d = 3, align = "lrrrrrr")
+```
+
+Con $n$ = `r fmt(n, 0)` canciones, Sturges sugiere k = `r k` clases. Con rango = `r rango` y amplitud **`r amplitud`**, bastan **`r k_final` clases** para cubrir de `r minimo` a `r maximo` sin dejar una clase vacía al final. La última clase incluye el valor máximo.
+
+### B.2 Medidas de tendencia central y dispersión (datos agrupados)
+
+```{r medidas-agrupadas}
+media_g   <- sum(frecuencias$xi * frecuencias$fi) / n
+clase_med <- which(frecuencias$Fi >= n / 2)[1]
+Fi_ant    <- ifelse(clase_med == 1, 0, frecuencias$Fi[clase_med - 1])
+mediana_g <- frecuencias$lim_inf[clase_med] + ((n / 2 - Fi_ant) / frecuencias$fi[clase_med]) * amplitud
+clase_mod <- which.max(frecuencias$fi)
+d1 <- frecuencias$fi[clase_mod] - ifelse(clase_mod == 1, 0, frecuencias$fi[clase_mod - 1])
+d2 <- frecuencias$fi[clase_mod] - ifelse(clase_mod == k_final, 0, frecuencias$fi[clase_mod + 1])
+moda_g    <- frecuencias$lim_inf[clase_mod] + d1 / (d1 + d2) * amplitud
+var_g     <- sum(frecuencias$fi * (frecuencias$xi - media_g)^2) / (n - 1)
+sd_g      <- sqrt(var_g)
+asim_g    <- sum(frecuencias$fi * (frecuencias$xi - media_g)^3) / n / sd_g^3
+curt_g    <- sum(frecuencias$fi * (frecuencias$xi - media_g)^4) / n / sd_g^4 - 3
+
+medidas <- tibble(
+  Medida = c("Media", "Mediana", "Moda", "Desviación estándar", "Coeficiente de variación (%)",
+             "Asimetría", "Curtosis (exceso)"),
+  `Datos agrupados` = c(media_g, mediana_g, moda_g, sd_g, sd_g / media_g * 100, asim_g, curt_g),
+  `Datos sin agrupar` = c(mean(x), median(x), NA, sd(x), sd(x) / mean(x) * 100,
+                          mean((x - mean(x))^3) / sd(x)^3, mean((x - mean(x))^4) / sd(x)^4 - 3)
+)
+tabla(medidas, 2)
+```
+
+La popularidad promedio es de **`r fmt(media_g, 1)` puntos** y la mediana **`r fmt(mediana_g, 1)`**. Las medidas agrupadas casi no se alejan de las calculadas con los datos originales, lo que confirma que la tabla resume bien la variable. La asimetría (`r fmt(asim_g)`) es ligeramente negativa: hay una cola de canciones poco populares (popularidad 1 a 10). La curtosis negativa indica una distribución más aplanada que la normal. El coeficiente de variación de `r fmt(sd_g / media_g * 100, 0)` % muestra una dispersión alta: las canciones van desde casi desconocidas hasta éxitos globales.
+
+### B.3 Histograma y ojiva
+
+```{r histograma-ojiva, fig.height = 4.2}
+g_hist <- ggplot(frecuencias, aes(x = xi, y = fi)) +
+  geom_col(width = amplitud * 0.95, fill = AZUL) +
+  geom_vline(xintercept = media_g, color = NARANJA, linewidth = 0.9) +
+  annotate("text", x = media_g + 2, y = max(frecuencias$fi) * 1.02, hjust = 0,
+           label = paste("Media =", fmt(media_g, 1)), size = 3.3, color = "#52514e") +
+  labs(title = "Histograma de la popularidad", x = "Popularidad (marca de clase)", y = "Frecuencia (fi)")
+
+g_ojiva <- ggplot(bind_rows(tibble(lim_sup = minimo, Fr = 0), frecuencias), aes(x = lim_sup, y = Fr)) +
+  geom_line(color = AZUL, linewidth = 1) +
+  geom_point(color = AZUL, size = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = GRIS) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Ojiva (frecuencia relativa acumulada)", x = "Popularidad (límite superior)", y = "Fr")
+
+g_hist + g_ojiva
+```
+
+---
+
+## Parte C: Inferencia estadística
+
+En todas las pruebas se usa un nivel de significancia de $\alpha = 0.05$.
+
+### C.1 ¿La popularidad es distinta entre géneros?
+
+$H_0$: la popularidad media es igual en los seis géneros. $H_1$: al menos un género tiene una media distinta.
+
+```{r anova}
+anova_genero <- aov(popularidad ~ genero, data = con_pop)
+res_anova    <- broom::tidy(anova_genero)
+eta2         <- res_anova$sumsq[1] / sum(res_anova$sumsq)
+kruskal      <- kruskal.test(popularidad ~ genero, data = con_pop)
+
+# Supuesto de normalidad: Shapiro-Wilk sobre una muestra de residuos (la prueba acepta máximo 5,000)
+set.seed(SEMILLA)
+shapiro <- shapiro.test(sample(residuals(anova_genero), 5000))
+levene_aprox <- bartlett.test(popularidad ~ genero, data = con_pop)
+
+tabla(tibble(
+  Prueba = c("ANOVA de un factor", "Kruskal-Wallis (no paramétrica)",
+             "Shapiro-Wilk sobre residuos (normalidad)", "Bartlett (igualdad de varianzas)"),
+  Estadístico = c(res_anova$statistic[1], kruskal$statistic, shapiro$statistic, levene_aprox$statistic),
+  `Valor p` = c(pval(res_anova$p.value[1]), pval(kruskal$p.value), pval(shapiro$p.value), pval(levene_aprox$p.value))
+), d = 3)
+```
+
+Tanto ANOVA como Kruskal-Wallis **rechazan $H_0$** (p `r pval(res_anova$p.value[1])`): la popularidad sí depende del género. Como los residuos no son normales y las varianzas no son iguales, la conclusión más confiable es la de **Kruskal-Wallis**, que no necesita esos supuestos. Aun así, el tamaño del efecto es pequeño: el género explica solo el **`r fmt(eta2 * 100, 1)` %** de la variación de la popularidad ($\eta^2$ = `r fmt(eta2, 3)`).
+
+**¿Qué géneros difieren entre sí?** Comparaciones por pares con la prueba de Wilcoxon y corrección de Holm:
+
+```{r post-hoc, fig.height = 4.2}
+pares <- pairwise.wilcox.test(con_pop$popularidad, con_pop$genero, p.adjust.method = "holm")
+matriz_p <- as.data.frame(as.table(pares$p.value)) %>%
+  filter(!is.na(Freq)) %>%
+  rename(Género_1 = Var1, Género_2 = Var2, p = Freq) %>%
+  mutate(Significativa = if_else(p < 0.05, "Sí", "No"))
+
+ggplot(matriz_p, aes(Género_2, Género_1, fill = Significativa)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = pval(p)), size = 3.3, color = "white") +
+  scale_fill_manual(values = c("Sí" = AZUL, "No" = GRIS)) +
+  labs(title = "Comparaciones por pares (valor p ajustado por Holm)", x = NULL, y = NULL,
+       fill = "¿Diferencia significativa?") +
+  theme(panel.grid = element_blank())
+
+no_sig <- matriz_p %>% filter(Significativa == "No")
+```
+
+`r if (nrow(no_sig) > 0) paste0("Los pares **sin** diferencia significativa son: ", paste0(no_sig$Género_1, " vs. ", no_sig$Género_2, collapse = "; "), ". Todos los demás pares sí difieren.") else "Todos los pares de géneros difieren significativamente."` EDM es significativamente menos popular que todos los demás géneros.
+
+### C.2 ¿El modo (mayor/menor) depende del género?
+
+$H_0$: el género y el modo son independientes. Se usa la prueba $\chi^2$ de independencia y la V de Cramér para medir la fuerza de la asociación.
+
+```{r chi-cuadrado, fig.height = 3.8}
+tabla_modo <- table(spotify$genero, spotify$modo)
+chi <- chisq.test(tabla_modo)
+v_cramer <- sqrt(chi$statistic / (sum(tabla_modo) * (min(dim(tabla_modo)) - 1)))
+
+prop_modo <- spotify %>% count(genero, modo) %>% group_by(genero) %>% mutate(p = n / sum(n)) %>% ungroup()
+tabla(prop_modo %>% select(-n) %>% pivot_wider(names_from = modo, values_from = p) %>%
+        mutate(across(c(Mayor, Menor), ~ .x * 100)) %>% rename(Género = genero, `% Mayor` = Mayor, `% Menor` = Menor), 1)
+
+ggplot(prop_modo %>% filter(modo == "Mayor"), aes(x = reorder(genero, p), y = p, fill = genero)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_hline(yintercept = mean(spotify$modo == "Mayor"), linetype = "dashed", color = GRIS) +
+  geom_text(aes(label = percent(p, 1)), hjust = -0.15, size = 3.3, color = "#52514e") +
+  scale_fill_manual(values = colores_genero) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.8)) +
+  coord_flip() +
+  labs(title = "% de canciones en tono mayor por género", x = NULL, y = "% en modo mayor",
+       caption = "Línea punteada: promedio de toda la base")
+```
+
+$\chi^2$ = `r fmt(chi$statistic, 1)`, gl = `r chi$parameter`, p `r pval(chi$p.value)`: se **rechaza $H_0$**, el modo depende del género. Pero la V de Cramér es apenas **`r fmt(v_cramer, 3)`**, una asociación **débil**. Con más de 26,000 canciones, cualquier diferencia pequeña sale significativa; por eso siempre conviene acompañar el valor p con una medida del tamaño del efecto.
+
+### C.3 ¿Las canciones en tono mayor son más alegres?
+
+$H_0$: la positividad (*valence*) media es igual en tono mayor y menor. Se usa la prueba t de Welch (no asume varianzas iguales).
+
+```{r prueba-t}
+t_modo <- t.test(valence ~ modo, data = spotify)
+medias_modo <- spotify %>% group_by(modo) %>% summarise(Canciones = n(), `Positividad media` = mean(valence))
+tabla(medias_modo %>% rename(Modo = modo), 3)
+d_cohen <- diff(rev(t_modo$estimate)) / sd(spotify$valence)
+```
+
+t = `r fmt(t_modo$statistic, 2)`, p = `r pval(t_modo$p.value)`. `r if (t_modo$p.value < 0.05) "Se rechaza $H_0$" else "**No se rechaza $H_0$**"`. La diferencia de medias es de solo **`r fmt(abs(diff(t_modo$estimate)), 3)`** puntos en una escala de 0 a 1 (d de Cohen ≈ `r fmt(abs(d_cohen), 3)`). La idea popular de que "mayor = alegre y menor = triste" **casi no se refleja** en la positividad que mide Spotify: la alegría de una canción depende más del ritmo, la instrumentación y la producción que del modo.
+
+### C.4 ¿Qué características de audio se asocian con la popularidad?
+
+Correlación de Spearman (no exige normalidad) entre cada variable y la popularidad:
+
+```{r correlaciones, fig.height = 4.2}
+cor_pop <- map_dfr(c(AUDIO, "anio"), function(v) {
+  prueba <- cor.test(con_pop[[v]], con_pop$popularidad, method = "spearman", exact = FALSE)
+  tibble(Variable = v, rho = unname(prueba$estimate), p = prueba$p.value)
+}) %>% arrange(desc(abs(rho)))
+
+ggplot(cor_pop, aes(x = rho, y = reorder(Variable, abs(rho)), fill = rho > 0)) +
+  geom_col(width = 0.65, show.legend = FALSE) +
+  geom_vline(xintercept = 0, color = "#52514e") +
+  geom_text(aes(label = fmt(rho, 3), hjust = if_else(rho > 0, -0.15, 1.15)), size = 3.2, color = "#52514e") +
+  scale_fill_manual(values = c(`TRUE` = AZUL, `FALSE` = NARANJA)) +
+  scale_x_continuous(limits = c(-0.25, 0.25)) +
+  labs(title = "Correlación de Spearman con la popularidad", x = "rho", y = NULL)
+
+tabla(cor_pop %>% mutate(`Valor p` = pval(p), `Significativa (α = 0.05)` = if_else(p < 0.05, "Sí", "No")) %>% select(-p), 3)
+n_sig <- sum(cor_pop$p < 0.05)
+```
+
+`r n_sig` de las `r nrow(cor_pop)` variables tienen correlación estadísticamente significativa, pero **ninguna pasa de |ρ| = `r fmt(max(abs(cor_pop$rho)), 2)`**. Ese es el patrón de una base grande: muchas relaciones "significativas" que en la práctica son muy débiles. La relación más fuerte es con **`r cor_pop$Variable[1]`** (ρ = `r fmt(cor_pop$rho[1], 3)`).
+
+---
+
+## Parte D: Modelos para predecir la popularidad (regresión)
+
+**Pregunta:** si se conocen las características de audio, el año, el género y el tipo de sonido (cluster) de una canción, ¿qué tan bien se puede predecir su popularidad?
+
+Se comparan tres enfoques, igual que en la clase de entrenamiento de modelos: un modelo **lineal** (rápido y simple), **Random Forest** (reduce el sobreajuste) y **Gradient Boosting** (de los mejores para datos tabulares). Como referencia mínima se agrega un modelo *base* que siempre predice la media.
+
+### D.1 División entrenamiento / prueba
+
+```{r split}
+datos_modelo <- con_pop %>%
+  select(popularidad, all_of(AUDIO), key, mode, anio, genero, nombre_cluster) %>%
+  mutate(nombre_cluster = factor(nombre_cluster))
+
+set.seed(SEMILLA)
+particion <- initial_split(datos_modelo, prop = 0.75, strata = popularidad)
+train <- training(particion)
+test  <- testing(particion)
+```
+
+Entrenamiento: **`r fmt(nrow(train), 0)` canciones (75 %)**. Prueba: **`r fmt(nrow(test), 0)` (25 %)**. La división se estratifica por popularidad para que ambas partes tengan la misma distribución.
+
+### D.2 Entrenamiento
+
+```{r entrenamiento}
+formula_pop <- popularidad ~ .
+
+# Modelo 0: base (predice siempre la media de entrenamiento)
+pred_base <- rep(mean(train$popularidad), nrow(test))
+
+# Modelo 1: regresión lineal múltiple
+lm_fit <- lm(formula_pop, data = train)
+
+# Modelo 2: Random Forest
+set.seed(SEMILLA)
+rf_fit <- ranger(formula_pop, data = train, num.trees = 500, min.node.size = 5,
+                 importance = "permutation", seed = SEMILLA)
+
+# Modelo 3: Gradient Boosting
+set.seed(SEMILLA)
+gbm_fit <- gbm(formula_pop, data = train, distribution = "gaussian", n.trees = 800,
+               interaction.depth = 5, shrinkage = 0.03, n.minobsinnode = 20,
+               bag.fraction = 0.8, cv.folds = 5, verbose = FALSE)
+mejor_iter <- gbm.perf(gbm_fit, method = "cv", plot.it = FALSE)
+```
+
+En Gradient Boosting el número óptimo de árboles se eligió con validación cruzada de 5 particiones: **`r mejor_iter` árboles**.
+
+### D.3 Evaluación en el conjunto de prueba
+
+```{r evaluacion}
+metricas <- function(real, pred, modelo) {
+  tibble(Modelo = modelo,
+         RMSE = sqrt(mean((real - pred)^2)),
+         MAE  = mean(abs(real - pred)),
+         R2   = 1 - sum((real - pred)^2) / sum((real - mean(real))^2))
+}
+predicciones <- tibble(
+  real = test$popularidad,
+  Base = pred_base,
+  `Regresión lineal` = predict(lm_fit, test),
+  `Random Forest` = predict(rf_fit, test)$predictions,
+  `Gradient Boosting` = predict(gbm_fit, test, n.trees = mejor_iter)
+)
+comparacion <- bind_rows(
+  metricas(predicciones$real, predicciones$Base, "Base (media)"),
+  metricas(predicciones$real, predicciones$`Regresión lineal`, "Regresión lineal"),
+  metricas(predicciones$real, predicciones$`Random Forest`, "Random Forest"),
+  metricas(predicciones$real, predicciones$`Gradient Boosting`, "Gradient Boosting")
+) %>% arrange(RMSE)
+tabla(comparacion, 3)
+mejor_reg <- comparacion$Modelo[1]
+r2_lm <- comparacion$R2[comparacion$Modelo == "Regresión lineal"]
+```
+
+* **RMSE** mide el error típico en puntos de popularidad (penaliza más los errores grandes).
+* **MAE** es el error absoluto promedio.
+* **R²** es la proporción de la variación de la popularidad que el modelo explica.
+
+El mejor modelo es **`r mejor_reg`**, con un error típico de **`r fmt(comparacion$RMSE[1], 1)` puntos** y un **R² de `r fmt(comparacion$R2[1], 3)`**. Explica cerca del `r fmt(comparacion$R2[1] * 100, 0)` % de la variación, frente a solo el `r fmt(r2_lm * 100, 0)` % del modelo lineal. Mejora claramente a la referencia, pero **la mayor parte de la popularidad sigue sin explicarse**. Este resultado es coherente con la Parte C: el sonido de una canción influye poco en su popularidad.
+
+```{r real-vs-predicho, fig.height = 4.5}
+ggplot(predicciones, aes(x = real, y = .data[[mejor_reg]])) +
+  geom_point(alpha = 0.15, size = 1, color = AZUL) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = NARANJA, linewidth = 0.9) +
+  coord_equal(xlim = c(0, 100), ylim = c(0, 100)) +
+  labs(title = paste("Popularidad real vs. predicha:", mejor_reg),
+       subtitle = "La línea punteada es la predicción perfecta", x = "Popularidad real", y = "Popularidad predicha")
+```
+
+El `r fmt(mean(between(predicciones[[mejor_reg]], 30, 60)) * 100, 0)` % de las predicciones cae entre 30 y 60, aunque la popularidad real va de 1 a 100. El modelo "juega a lo seguro": **sobreestima las canciones poco populares y subestima los grandes éxitos**. Para predecir un éxito harían falta variables que esta base no tiene, como la fama del artista, el presupuesto de promoción, la presencia en playlists editoriales o el uso en redes sociales.
+
+### D.4 Importancia de variables (Random Forest)
+
+```{r importancia-rf, fig.height = 4.8}
+imp_rf <- enframe(rf_fit$variable.importance, name = "Variable", value = "Importancia") %>%
+  arrange(Importancia)
+ggplot(imp_rf, aes(x = Importancia, y = factor(Variable, levels = Variable))) +
+  geom_col(fill = AZUL, width = 0.65) +
+  labs(title = "Importancia por permutación (Random Forest)",
+       x = "Aumento del error cuadrático al desordenar la variable", y = NULL)
+top_rf <- rev(tail(imp_rf$Variable, 3))
+```
+
+Las variables más importantes son **`r top_rf[1]`**, **`r top_rf[2]`** y **`r top_rf[3]`**. Ninguna de las tres es por sí sola una "fórmula del éxito": el modelo combina muchas señales débiles.
+
+### D.5 Coeficientes del modelo lineal
+
+El modelo lineal predice peor, pero permite **interpretar** la dirección de cada efecto. Coeficientes significativos (p < 0.05):
+
+```{r coeficientes}
+coefs <- broom::tidy(lm_fit) %>%
+  filter(term != "(Intercept)", p.value < 0.05) %>%
+  arrange(desc(abs(statistic))) %>%
+  transmute(Término = term, Coeficiente = estimate, `Error estándar` = std.error,
+            t = statistic, `Valor p` = pval(p.value))
+tabla(coefs, 3)
+```
+
+Los coeficientes de género se interpretan respecto a **EDM** (la categoría base). Por ejemplo, el coeficiente de `generopop` indica cuántos puntos más de popularidad tiene, en promedio, una canción pop frente a una de EDM con las mismas características de audio.
+
+---
+
+## Parte E: ¿Es un éxito? Clasificación binaria con curva ROC
+
+Se replantea la pregunta como clasificación: **¿la canción es un éxito (popularidad ≥ 70)?**
+
+```{r hit-prep}
+umbral_hit <- 70
+datos_hit <- datos_modelo %>% mutate(exito = factor(if_else(popularidad >= umbral_hit, "Sí", "No"), levels = c("No", "Sí")))
+train_h <- datos_hit[particion$in_id, ] %>% select(-popularidad)
+test_h  <- datos_hit[-particion$in_id, ] %>% select(-popularidad)
+pct_hit <- mean(datos_hit$exito == "Sí") * 100
+
+logit_fit <- glm(exito ~ ., data = train_h, family = binomial)
+set.seed(SEMILLA)
+rf_hit <- ranger(exito ~ ., data = train_h, num.trees = 500, probability = TRUE, seed = SEMILLA)
+
+prob_logit <- predict(logit_fit, test_h, type = "response")
+prob_rf    <- predict(rf_hit, test_h)$predictions[, "Sí"]
+roc_logit  <- roc(test_h$exito, prob_logit, levels = c("No", "Sí"), direction = "<", quiet = TRUE)
+roc_rf     <- roc(test_h$exito, prob_rf, levels = c("No", "Sí"), direction = "<", quiet = TRUE)
+prueba_delong <- roc.test(roc_logit, roc_rf)
+```
+
+Solo el **`r fmt(pct_hit, 1)` %** de las canciones son éxitos, así que las clases están desbalanceadas. Se usan los mismos conjuntos de entrenamiento y prueba que en la Parte D.
+
+```{r roc-hit, fig.width = 6.5, fig.height = 5.5}
+curvas <- bind_rows(
+  tibble(fpr = 1 - roc_logit$specificities, tpr = roc_logit$sensitivities,
+         Modelo = paste0("Regresión logística (AUC = ", fmt(auc(roc_logit), 3), ")")),
+  tibble(fpr = 1 - roc_rf$specificities, tpr = roc_rf$sensitivities,
+         Modelo = paste0("Random Forest (AUC = ", fmt(auc(roc_rf), 3), ")"))
+)
+ggplot(curvas, aes(fpr, tpr, color = Modelo)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(linetype = "dotted", color = GRIS) +
+  scale_color_manual(values = c(AZUL, NARANJA)) +
+  coord_equal() +
+  labs(title = "Curva ROC: ¿la canción es un éxito?", x = "Tasa de falsos positivos",
+       y = "Tasa de verdaderos positivos", color = NULL) +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+```{r umbral}
+# Umbral que maximiza el índice de Youden (sensibilidad + especificidad - 1)
+mejor_umbral <- coords(roc_rf, "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))
+pred_clase <- factor(if_else(prob_rf >= mejor_umbral$threshold, "Sí", "No"), levels = c("No", "Sí"))
+matriz <- table(Real = test_h$exito, Predicho = pred_clase)
+precision_hit <- matriz["Sí", "Sí"] / sum(matriz[, "Sí"])
+tabla(as.data.frame.matrix(matriz) %>% rownames_to_column("Real \\ Predicho"), 0)
+```
+
+El Random Forest obtiene un **AUC de `r fmt(auc(roc_rf), 3)`**, frente a `r fmt(auc(roc_logit), 3)` de la regresión logística. La prueba de DeLong indica que la diferencia `r if (prueba_delong$p.value < 0.05) "**es significativa**" else "**no es significativa**"` (p `r pval(prueba_delong$p.value)`). Con el umbral óptimo de Youden (`r fmt(mejor_umbral$threshold, 3)`), el modelo detecta el **`r fmt(mejor_umbral$sensitivity * 100, 0)` %** de los éxitos (sensibilidad) y descarta correctamente el **`r fmt(mejor_umbral$specificity * 100, 0)` %** de las canciones que no lo son (especificidad). Sin embargo, de las canciones que el modelo marca como éxito, solo el **`r fmt(precision_hit * 100, 0)` %** realmente lo es. Sirve para **filtrar** canciones con potencial, no para garantizar un éxito.
+
+---
+
+## Parte F: Exportación para Power BI
+
+```{r exportar}
+dir.create("powerbi", showWarnings = FALSE)
+resultados_r <- comparacion %>%
+  mutate(Herramienta = "R", Tarea = "Regresión de popularidad") %>%
+  bind_rows(tibble(Modelo = c("Regresión logística", "Random Forest"),
+                   AUC = c(as.numeric(auc(roc_logit)), as.numeric(auc(roc_rf))),
+                   Herramienta = "R", Tarea = "Clasificación de éxito (popularidad >= 70)"))
+write_csv(resultados_r %>% mutate(across(where(is.numeric), ~ round(.x, 4))),
+          "powerbi/resultados_popularidad.csv", na = "")
+write_csv(frecuencias %>% transmute(clase = paste0("[", lim_inf, ", ", lim_sup, ")"), orden = row_number(),
+                                    marca_clase = xi, fi, fr = round(fr, 4), Fi, Fr = round(Fr, 4)),
+          "powerbi/tabla_frecuencias_popularidad.csv")
+tabla(tibble(Archivo = c("powerbi/resultados_popularidad.csv", "powerbi/tabla_frecuencias_popularidad.csv"),
+             Contenido = c("Métricas de los modelos de esta parte", "Tabla de frecuencias de la Parte B")))
+```
+
+---
+
+## Conclusiones
+
+1. **La limpieza es reproducible:** las mismas reglas en R y en Python producen exactamente las mismas `r fmt(nrow(spotify), 0)` canciones.
+
+2. **La popularidad sí cambia según el género, pero el efecto es pequeño.** Las diferencias son estadísticamente significativas (Kruskal-Wallis, p `r pval(kruskal$p.value)`), con el pop como el género más popular y el EDM como el menos popular. Aun así, el género explica solo el `r fmt(eta2 * 100, 1)` % de la variación.
+
+3. **Significativo no es lo mismo que importante.** Con más de 20,000 canciones casi todas las pruebas salen significativas (modo vs. género, correlaciones con el audio), pero los tamaños de efecto (V de Cramér = `r fmt(v_cramer, 2)`, |ρ| ≤ `r fmt(max(abs(cor_pop$rho)), 2)`) muestran relaciones débiles. Además, el modo mayor o menor casi no cambia la positividad de una canción.
+
+4. **El sonido no basta para predecir la popularidad.** El mejor modelo (`r mejor_reg`) explica `r fmt(comparacion$R2[1] * 100, 0)` % de la variación, con un error típico de `r fmt(comparacion$RMSE[1], 1)` puntos. Los modelos de ensamble superan al lineal, pero todos tienden a predecir valores medios.
+
+5. **Detectar éxitos es más viable que predecir el número exacto.** Para identificar si una canción será un éxito (popularidad ≥ 70), el Random Forest alcanza un AUC de `r fmt(auc(roc_rf), 3)`. Es útil como filtro inicial, con muchos falsos positivos.
+
+**Conclusión general del proyecto (Partes 1 y 2):** las características de audio de Spotify describen muy bien **cómo suena** una canción, a tal punto que permiten adivinar su género con buena precisión. En cambio, dicen poco sobre **qué tan exitosa** será. El éxito depende sobre todo de factores externos al audio (artista, promoción, momento y algoritmos de recomendación), que esta base no incluye. Agregar ese tipo de variables sería el siguiente paso natural de este proyecto.

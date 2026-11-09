@@ -1,0 +1,904 @@
+---
+title: "Ciencia de Datos aplicada a 30,000 canciones de Spotify"
+subtitle: "Parte 1: limpieza, análisis exploratorio, clustering y clasificación de género (Python)"
+author: "Grupo 5"
+date: "2026-11-05"
+lang: es
+toc-title: "Índice"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  message: false
+fig-dpi: 150
+---
+
+```{python}
+#| label: setup
+#| code-summary: "Configuración y carga de datos"
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import Markdown, display
+
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.impute import KNNImputer
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import (silhouette_score, accuracy_score, f1_score,
+                             roc_auc_score, roc_curve, auc,
+                             confusion_matrix, classification_report)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+
+SEMILLA = 42
+sns.set_theme(style="whitegrid")
+plt.rcParams.update({
+    "axes.titleweight": "bold", "axes.titlesize": 12,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "grid.color": "#e6e6e6", "figure.figsize": (9, 4.8),
+})
+
+# Paleta: un color fijo por género (siempre el mismo en todo el informe)
+GENEROS = ["edm", "latin", "pop", "r&b", "rap", "rock"]
+COLORES_GENERO = dict(zip(GENEROS, ["#2a78d6", "#eb6834", "#1baf7a",
+                                    "#eda100", "#e87ba4", "#008300"]))
+AZUL, NARANJA, GRIS = "#2a78d6", "#eb6834", "#8a8984"
+
+# Variables de audio que entrega la API de Spotify
+AUDIO = ["danceability", "energy", "loudness", "speechiness", "acousticness",
+         "instrumentalness", "liveness", "valence", "tempo", "duracion_min"]
+
+
+def fmt(x, d=2):
+    """Formato de números para el texto."""
+    return f"{x:,.{d}f}"
+
+
+def tabla(df, decimales=2, index=False):
+    """Muestra un DataFrame como tabla Markdown."""
+    display(Markdown(df.to_markdown(index=index, floatfmt=f",.{decimales}f", intfmt=",")))
+
+
+def texto(s):
+    display(Markdown(s))
+
+
+crudo = pd.read_csv("data/spotify_songs.csv")
+```
+
+## Información general
+
+**Objetivo:** aplicar el ciclo completo de ciencia de datos (carga, limpieza, imputación, tratamiento de outliers, análisis descriptivo y diagnóstico, aprendizaje no supervisado y supervisado) a una base de datos real de canciones de Spotify.
+
+**Fuente:** *30,000 Spotify Songs*, publicada por el proyecto [TidyTuesday](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-01-21) (enero 2020). Los datos se obtuvieron de la API de Spotify con el paquete `spotifyr`: cada fila es una canción dentro de una playlist, y cada playlist está etiquetada con uno de seis géneros (EDM, latin, pop, R&B, rap y rock) y un subgénero.
+
+**Preguntas que guían el proyecto:**
+
+1. ¿Qué tan limpia viene la base y qué hay que corregir antes de analizarla?
+2. ¿En qué se diferencian, en términos de audio, los seis géneros?
+3. Sin usar la etiqueta de género, ¿las canciones forman grupos naturales? (clustering)
+4. ¿Se puede predecir el género de una canción solo con sus características de audio? (clasificación)
+5. ¿Qué tanto explican esas características la popularidad? (se responde en la Parte 2, en R)
+
+**Herramientas:** este documento usa Python (`pandas`, `numpy`, `matplotlib`, `seaborn`, `scikit-learn`). La Parte 2 (`02_analisis_r.Rmd`) hace la inferencia estadística y los modelos de popularidad en R, y la Parte 3 es un dashboard en Power BI construido con los datos limpios que exporta este documento.
+
+---
+
+## Parte A: Carga y exploración inicial
+
+### A.1 Dimensiones y diccionario de variables
+
+```{python}
+#| label: diccionario
+filas, columnas = crudo.shape
+descripciones = {
+    "track_id": "Identificador único de la canción en Spotify",
+    "track_name": "Nombre de la canción",
+    "track_artist": "Artista",
+    "track_popularity": "Popularidad (0-100) calculada por Spotify",
+    "track_album_id": "Identificador del álbum",
+    "track_album_name": "Nombre del álbum",
+    "track_album_release_date": "Fecha de lanzamiento del álbum",
+    "playlist_name": "Nombre de la playlist de donde se tomó",
+    "playlist_id": "Identificador de la playlist",
+    "playlist_genre": "Género de la playlist (6 categorías)",
+    "playlist_subgenre": "Subgénero de la playlist (24 categorías)",
+    "danceability": "Qué tan bailable es (0-1)",
+    "energy": "Intensidad y actividad percibida (0-1)",
+    "key": "Tonalidad (0 = Do, 1 = Do#, ..., 11 = Si)",
+    "loudness": "Volumen promedio en decibeles (dB)",
+    "mode": "Modo: 1 = mayor, 0 = menor",
+    "speechiness": "Presencia de palabra hablada (0-1)",
+    "acousticness": "Confianza de que es acústica (0-1)",
+    "instrumentalness": "Probabilidad de que no tenga voz (0-1)",
+    "liveness": "Probabilidad de que sea en vivo (0-1)",
+    "valence": "Positividad musical: alegre vs. triste (0-1)",
+    "tempo": "Tempo en pulsos por minuto (BPM)",
+    "duration_ms": "Duración en milisegundos",
+}
+tipos = {"int64": "Entero", "float64": "Decimal"}
+info = pd.DataFrame({
+    "Columna": crudo.columns,
+    "Tipo": [tipos.get(str(t), "Texto") for t in crudo.dtypes],
+    "Descripción": [descripciones[c] for c in crudo.columns],
+    "Nulos": crudo.isna().sum().values,
+})
+texto(f"La base cruda tiene **{fmt(filas, 0)} filas y {columnas} columnas**.")
+tabla(info)
+```
+
+### A.2 Primeras filas
+
+```{python}
+#| label: primeras-filas
+tabla(crudo[["track_name", "track_artist", "track_popularity", "playlist_genre",
+             "danceability", "energy", "valence", "tempo"]].head(8))
+```
+
+### A.3 Estadísticas descriptivas de las variables numéricas
+
+```{python}
+#| label: descriptivas-crudas
+num = crudo.select_dtypes("number")
+desc = num.describe().T
+desc["asimetría"] = num.skew()
+desc = desc.reset_index().rename(columns={"index": "Variable", "count": "n", "mean": "media",
+                                          "std": "desv.", "min": "mín", "max": "máx"})
+tabla(desc, decimales=2)
+```
+
+### A.4 Problemas de calidad detectados
+
+```{python}
+#| label: calidad
+nulos_texto = crudo["track_name"].isna().sum()
+dup_id = crudo["track_id"].duplicated().sum()
+ids_unicos = crudo["track_id"].nunique()
+multi_genero = (crudo.groupby("track_id")["playlist_genre"].nunique() > 1).sum()
+pop_cero = (crudo["track_popularity"] == 0).sum()
+largo_fecha = crudo["track_album_release_date"].str.len().value_counts()
+
+calidad = pd.DataFrame({
+    "Problema": [
+        "Filas sin nombre, artista ni álbum",
+        "Filas con track_id repetido (misma canción en varias playlists)",
+        "Canciones que aparecen en más de un género",
+        "Filas con popularidad exactamente 0",
+        "Fechas que solo traen el año (AAAA)",
+        "Fechas que solo traen año y mes (AAAA-MM)",
+    ],
+    "Cantidad": [nulos_texto, dup_id, multi_genero, pop_cero,
+                 largo_fecha.get(4, 0), largo_fecha.get(7, 0)],
+})
+tabla(calidad)
+texto(f"Hay **{fmt(ids_unicos, 0)} canciones distintas** en {fmt(filas, 0)} filas: "
+      f"el {fmt(dup_id / filas * 100, 1)} % de las filas son repeticiones de una canción que "
+      "aparece en más de una playlist. Las variables de audio no tienen nulos, pero eso no "
+      "significa que la base esté limpia.")
+```
+
+---
+
+## Parte B: Limpieza y preparación
+
+### B.1 Valores nulos en texto
+
+Las filas sin nombre de canción tampoco tienen artista ni álbum, y todas tienen popularidad 0. No es posible recuperar esa información sin consultar la API de nuevo, y son muy pocas, así que se **eliminan**.
+
+```{python}
+#| label: nulos-texto
+df = crudo.dropna(subset=["track_name", "track_artist"]).copy()
+texto(f"Se eliminaron **{len(crudo) - len(df)} filas**. Quedan {fmt(len(df), 0)}.")
+```
+
+### B.2 Duplicados
+
+Hay dos tipos de duplicado:
+
+* **Mismo `track_id`:** la misma canción tomada de varias playlists. Las características de audio son idénticas; solo cambia la playlist (y a veces el género).
+* **Mismo nombre y artista con distinto `track_id`:** la canción publicada como sencillo y luego dentro de un álbum, o una reedición. Son la misma obra musical.
+
+**Regla:** se ordena por popularidad de mayor a menor y se conserva la primera aparición, es decir, la versión más popular. El género asignado es el de la playlist donde aparece esa versión. La misma regla se replica en R para que ambas partes trabajen con las mismas canciones.
+
+```{python}
+#| label: duplicados
+antes = len(df)
+df = (df.sort_values("track_popularity", ascending=False, kind="stable")
+        .drop_duplicates("track_id")
+        .drop_duplicates(["track_name", "track_artist"])
+        .sort_index()
+        .reset_index(drop=True))
+texto(f"Se eliminaron **{fmt(antes - len(df), 0)} filas duplicadas**. "
+      f"La base limpia tiene **{fmt(len(df), 0)} canciones únicas**.")
+tabla(df["playlist_genre"].value_counts().rename_axis("Género")
+        .reset_index(name="Canciones").assign(**{"%": lambda t: t["Canciones"] / t["Canciones"].sum() * 100}), 1)
+```
+
+Después de quitar duplicados los seis géneros siguen bastante balanceados, lo que es bueno para el modelo de clasificación de la Parte F.
+
+### B.3 Popularidad 0: un nulo disfrazado
+
+```{python}
+#| label: pop-cero
+#| fig-cap: "Distribución de la popularidad. La barra en 0 rompe la forma del resto de la distribución."
+fig, ax = plt.subplots()
+ax.hist(df["track_popularity"], bins=101, range=(-0.5, 100.5), color=AZUL, edgecolor="white", linewidth=0.3)
+ax.set(xlabel="Popularidad (0-100)", ylabel="Canciones", title="Popularidad de las canciones")
+n0 = (df["track_popularity"] == 0).sum()
+n1 = (df["track_popularity"] == 1).sum()
+ax.annotate(f"{n0:,} canciones con popularidad 0", xy=(0, n0), xytext=(12, n0 * 0.92),
+            arrowprops=dict(arrowstyle="->", color=GRIS), color="#52514e")
+plt.show()
+texto(f"Hay **{fmt(n0, 0)} canciones con popularidad 0**, contra solo {fmt(n1, 0)} con popularidad 1. "
+      "Una caída así no es natural: Spotify asigna 0 cuando la canción fue retirada, re-enlazada a "
+      "otra versión o no tiene datos suficientes. Por eso el 0 se trata como **valor faltante** "
+      "(un nulo disfrazado), no como \"nadie la escucha\".")
+```
+
+**Comparación de métodos de imputación.** Para decidir qué hacer con esos valores se comparan tres opciones vistas en clase: eliminar, imputar con la mediana del género e imputar con KNN (las 5 canciones más parecidas en audio).
+
+```{python}
+#| label: imputacion
+df["popularidad"] = df["track_popularity"].replace(0, np.nan)
+faltan = df["popularidad"].isna()
+
+# 1) Mediana por género
+imp_mediana = df["popularidad"].fillna(df.groupby("playlist_genre")["popularidad"].transform("median"))
+
+# 2) KNN con variables de audio estandarizadas
+base_knn = df[["danceability", "energy", "loudness", "speechiness", "acousticness",
+               "instrumentalness", "valence", "tempo"]]
+base_knn = pd.DataFrame(StandardScaler().fit_transform(base_knn), columns=base_knn.columns)
+base_knn["popularidad"] = df["popularidad"].values
+imp_knn = pd.Series(KNNImputer(n_neighbors=5).fit_transform(base_knn)[:, -1])
+
+comparacion = pd.DataFrame({
+    "Método": ["Original (con ceros)", "Eliminar faltantes", "Mediana por género", "KNN (k = 5)"],
+    "n": [len(df), (~faltan).sum(), len(df), len(df)],
+    "Media": [df["track_popularity"].mean(), df["popularidad"].mean(), imp_mediana.mean(), imp_knn.mean()],
+    "Mediana": [df["track_popularity"].median(), df["popularidad"].median(), imp_mediana.median(), imp_knn.median()],
+    "Desv. estándar": [df["track_popularity"].std(), df["popularidad"].std(), imp_mediana.std(), imp_knn.std()],
+})
+tabla(comparacion, 2)
+
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.4), sharey=True)
+for ax, (nombre, serie) in zip(axes, [("Eliminar faltantes", df["popularidad"].dropna()),
+                                      ("Mediana por género", imp_mediana),
+                                      ("KNN (k = 5)", imp_knn)]):
+    ax.hist(serie, bins=50, color=AZUL, edgecolor="white", linewidth=0.3)
+    ax.set_title(nombre)
+    ax.set_xlabel("Popularidad")
+axes[0].set_ylabel("Canciones")
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: imputacion-texto
+texto(f"La mediana por género crea picos artificiales (todas las canciones imputadas de un género "
+      f"reciben el mismo valor) y reduce la desviación estándar. KNN conserva mejor la forma, pero "
+      f"sigue inventando {fmt(faltan.sum(), 0)} valores de la variable que se quiere explicar. "
+      "**Decisión:** la popularidad es la variable respuesta de los modelos de la Parte 2, e imputar la "
+      "variable respuesta introduce información falsa en el entrenamiento. Por eso, en los análisis de "
+      "popularidad se **excluyen** las canciones con popularidad faltante. En el clustering y en la "
+      "clasificación de género sí se usan todas las canciones, porque ahí la popularidad no interviene.")
+```
+
+### B.4 Variables derivadas
+
+```{python}
+#| label: derivadas
+df["anio"] = df["track_album_release_date"].str[:4].astype(int)
+df["decada"] = (df["anio"] // 10 * 10).astype(str) + "s"
+df["duracion_min"] = df["duration_ms"] / 60000
+df["modo"] = df["mode"].map({1: "Mayor", 0: "Menor"})
+df["nivel_popularidad"] = pd.cut(df["popularidad"], bins=[0, 30, 60, 100],
+                                 labels=["Baja (1-30)", "Media (31-60)", "Alta (61-100)"])
+derivadas = pd.DataFrame({
+    "Variable nueva": ["popularidad", "anio", "decada", "duracion_min", "modo", "nivel_popularidad"],
+    "Cómo se construyó": [
+        "track_popularity con los 0 convertidos en faltantes",
+        "Primeros 4 caracteres de la fecha (todas las fechas traen al menos el año)",
+        "Década del año de lanzamiento",
+        "duration_ms / 60,000",
+        "mode convertido a texto (Mayor / Menor)",
+        "Popularidad agrupada en 3 niveles",
+    ],
+})
+tabla(derivadas)
+texto(f"Los lanzamientos van de **{df['anio'].min()} a {df['anio'].max()}**.")
+```
+
+### B.5 Valores atípicos (outliers)
+
+Se usa el criterio de Tukey: un valor es atípico si está fuera de $[Q_1 - 1.5\,IQR,\; Q_3 + 1.5\,IQR]$.
+
+```{python}
+#| label: outliers
+def limites_iqr(x):
+    q1, q3 = x.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+filas_out = []
+for v in AUDIO:
+    li, ls = limites_iqr(df[v])
+    n_out = ((df[v] < li) | (df[v] > ls)).sum()
+    filas_out.append([v, li, ls, n_out, n_out / len(df) * 100])
+outliers = pd.DataFrame(filas_out, columns=["Variable", "Límite inferior", "Límite superior",
+                                            "Atípicos", "% atípicos"]).sort_values("Atípicos", ascending=False)
+tabla(outliers, 2)
+```
+
+```{python}
+#| label: boxplots
+#| fig-cap: "Variables de audio estandarizadas (puntaje z). Los puntos fuera de los bigotes son atípicos según IQR."
+z = (df[AUDIO] - df[AUDIO].mean()) / df[AUDIO].std()
+fig, ax = plt.subplots(figsize=(10, 4.5))
+sns.boxplot(data=z.melt(var_name="Variable", value_name="z"), x="Variable", y="z",
+            color=AZUL, fliersize=1.2, linewidth=0.9, ax=ax)
+ax.set(xlabel="", ylabel="Puntaje z", title="Atípicos por variable de audio")
+ax.tick_params(axis="x", rotation=30)
+plt.show()
+```
+
+No todos los "atípicos" son errores:
+
+* **instrumentalness, speechiness, liveness y acousticness** son variables muy sesgadas: la mayoría de canciones está cerca de 0 y unas pocas (temas instrumentales, rap muy hablado, grabaciones en vivo) están arriba. Son valores reales y además ayudan a distinguir géneros, así que **se conservan**.
+* **duracion_min, loudness y tempo** sí tienen extremos raros: canciones de menos de un minuto (intros o *skits*), volumen muy bajo o tempo igual a 0. Para que esos casos no dominen el clustering (K-Means usa distancias), se **winsorizan al percentil 1 y 99**. La variable original se mantiene para los demás análisis.
+
+```{python}
+#| label: winsor
+def winsorizar(x, inferior=0.01, superior=0.99):
+    li, ls = x.quantile([inferior, superior])
+    return x.clip(li, ls)
+
+for v in ["duracion_min", "loudness", "tempo"]:
+    df[f"{v}_w"] = winsorizar(df[v])
+
+antes_despues = pd.DataFrame({
+    "Variable": ["duracion_min", "loudness", "tempo"],
+    "Mín. antes": [df[v].min() for v in ["duracion_min", "loudness", "tempo"]],
+    "Mín. después": [df[f"{v}_w"].min() for v in ["duracion_min", "loudness", "tempo"]],
+    "Máx. antes": [df[v].max() for v in ["duracion_min", "loudness", "tempo"]],
+    "Máx. después": [df[f"{v}_w"].max() for v in ["duracion_min", "loudness", "tempo"]],
+})
+tabla(antes_despues, 2)
+```
+
+---
+
+## Parte C: Análisis descriptivo
+
+### C.1 Distribución de las variables de audio
+
+```{python}
+#| label: histogramas
+#| fig-cap: "Distribución de cada variable de audio (base limpia)."
+nombres = {"danceability": "Bailabilidad", "energy": "Energía", "loudness": "Volumen (dB)",
+           "speechiness": "Palabra hablada", "acousticness": "Acústica",
+           "instrumentalness": "Instrumental", "liveness": "En vivo", "valence": "Positividad",
+           "tempo": "Tempo (BPM)", "duracion_min": "Duración (min)"}
+fig, axes = plt.subplots(2, 5, figsize=(13, 5.2))
+for ax, v in zip(axes.flat, AUDIO):
+    ax.hist(df[v], bins=40, color=AZUL, edgecolor="white", linewidth=0.3)
+    ax.axvline(df[v].median(), color=NARANJA, lw=1.5)
+    ax.set_title(nombres[v], fontsize=10)
+    ax.set_yticks([])
+fig.suptitle("Variables de audio (línea naranja = mediana)", fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+asim = df[AUDIO].skew().sort_values()
+texto(f"Las canciones de la base son, en general, **bailables y enérgicas** (mediana de bailabilidad "
+      f"{fmt(df['danceability'].median())} y de energía {fmt(df['energy'].median())}), con duración típica "
+      f"de {fmt(df['duracion_min'].median())} minutos y tempo cercano a {fmt(df['tempo'].median(), 0)} BPM. "
+      f"Las variables más sesgadas a la derecha son instrumentalness (asimetría {fmt(asim['instrumentalness'])}), "
+      f"liveness ({fmt(asim['liveness'])}) y speechiness ({fmt(asim['speechiness'])}).")
+```
+
+### C.2 Canciones por género y por década
+
+```{python}
+#| label: genero-decada
+#| fig-cap: "Composición de la base por género (izquierda) y por década de lanzamiento (derecha)."
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+conteo = df["playlist_genre"].value_counts().reindex(GENEROS)
+ax1.bar(conteo.index, conteo.values, color=[COLORES_GENERO[g] for g in conteo.index], width=0.7)
+for i, v in enumerate(conteo.values):
+    ax1.text(i, v + 60, f"{v:,}", ha="center", fontsize=9, color="#52514e")
+ax1.set(title="Canciones por género", ylabel="Canciones")
+
+dec = df["decada"].value_counts().sort_index()
+ax2.bar(dec.index, dec.values, color=AZUL, width=0.7)
+ax2.set(title="Canciones por década de lanzamiento", ylabel="Canciones")
+ax2.tick_params(axis="x", rotation=45)
+plt.tight_layout()
+plt.show()
+
+pct_2010 = (df["anio"] >= 2010).mean() * 100
+texto(f"El **{fmt(pct_2010, 1)} %** de las canciones salió de 2010 en adelante: la base refleja "
+      "principalmente música reciente, porque las playlists de Spotify priorizan lo actual.")
+```
+
+### C.3 Popularidad por género
+
+```{python}
+#| label: pop-genero
+#| fig-cap: "Popularidad por género (sin las canciones con popularidad faltante)."
+con_pop = df.dropna(subset=["popularidad"])
+orden = con_pop.groupby("playlist_genre")["popularidad"].median().sort_values(ascending=False).index
+fig, ax = plt.subplots()
+sns.boxplot(data=con_pop, x="playlist_genre", y="popularidad", order=orden,
+            palette=COLORES_GENERO, fliersize=1, linewidth=0.9, ax=ax)
+ax.set(xlabel="Género", ylabel="Popularidad", title="Popularidad por género")
+plt.show()
+
+resumen_pop = (con_pop.groupby("playlist_genre")["popularidad"]
+               .agg(Canciones="count", Media="mean", Mediana="median", Desv="std")
+               .reindex(orden).reset_index().rename(columns={"playlist_genre": "Género"}))
+tabla(resumen_pop, 1)
+```
+
+```{python}
+#| label: pop-genero-texto
+texto(f"**{orden[0].upper()}** es el género con mayor popularidad mediana "
+      f"({fmt(resumen_pop['Mediana'].iloc[0], 0)}) y **{orden[-1].upper()}** el de menor "
+      f"({fmt(resumen_pop['Mediana'].iloc[-1], 0)}). Las cajas se traslapan mucho: el género influye, "
+      "pero dentro de cada género hay canciones de todo nivel de popularidad. En la Parte 2 se prueba "
+      "formalmente si estas diferencias son estadísticamente significativas.")
+```
+
+---
+
+## Parte D: Análisis diagnóstico
+
+### D.1 Correlaciones
+
+```{python}
+#| label: correlacion
+#| fig-cap: "Correlación de Pearson entre variables de audio, año y popularidad."
+vars_cor = AUDIO + ["anio", "popularidad"]
+cor = df[vars_cor].corr()
+mascara = np.triu(np.ones_like(cor, dtype=bool))
+fig, ax = plt.subplots(figsize=(9, 7))
+sns.heatmap(cor, mask=mascara, cmap="RdBu_r", center=0, vmin=-1, vmax=1, annot=True, fmt=".2f",
+            annot_kws={"size": 8}, linewidths=0.5, cbar_kws={"shrink": 0.7}, ax=ax)
+ax.set_title("Matriz de correlación")
+plt.show()
+
+pares = (cor.where(~mascara).stack().rename("r").reset_index()
+         .assign(abs_r=lambda t: t["r"].abs()).sort_values("abs_r", ascending=False))
+pares.columns = ["Variable 1", "Variable 2", "r", "|r|"]
+texto("**Las 5 correlaciones más fuertes:**")
+tabla(pares.head(5).drop(columns="|r|"), 2)
+cor_pop = cor["popularidad"].drop("popularidad").sort_values(key=abs, ascending=False)
+texto(f"La relación más fuerte es entre **energía y volumen** (r = {fmt(cor.loc['energy', 'loudness'])}): "
+      "las canciones enérgicas se masterizan más fuerte. Energía y acústica van en sentido contrario "
+      f"(r = {fmt(cor.loc['energy', 'acousticness'])}). En cambio, **ninguna variable de audio se "
+      f"correlaciona fuerte con la popularidad**: la mayor es {cor_pop.index[0]} "
+      f"(r = {fmt(cor_pop.iloc[0])}). Esto ya anticipa que la popularidad será difícil de predecir "
+      "solo con el sonido.")
+```
+
+### D.2 ¿Qué distingue a cada género?
+
+```{python}
+#| label: perfil-genero
+#| fig-cap: "Promedio de cada variable por género, en puntaje z (0 = promedio de toda la base)."
+perfil = df.groupby("playlist_genre")[AUDIO].mean().reindex(GENEROS)
+perfil_z = (perfil - df[AUDIO].mean()) / df[AUDIO].std()
+fig, ax = plt.subplots(figsize=(10, 4.2))
+sns.heatmap(perfil_z.rename(columns=nombres), cmap="RdBu_r", center=0, vmin=-1.2, vmax=1.2,
+            annot=True, fmt=".2f", annot_kws={"size": 8}, linewidths=0.5, ax=ax,
+            cbar_kws={"label": "Puntaje z"})
+ax.set(xlabel="", ylabel="", title="Perfil de audio de cada género")
+ax.tick_params(axis="x", rotation=30)
+plt.show()
+
+def rasgo(genero):
+    fila = perfil_z.loc[genero]
+    alto, bajo = fila.idxmax(), fila.idxmin()
+    return f"más {nombres[alto].lower()} ({fmt(fila[alto])}) y menos {nombres[bajo].lower()} ({fmt(fila[bajo])})"
+
+texto("Rasgo más alto y más bajo de cada género respecto al promedio:\n\n" +
+      "\n".join(f"* **{g.upper()}**: {rasgo(g)}." for g in GENEROS))
+```
+
+### D.3 ¿Cómo ha cambiado el sonido con los años?
+
+```{python}
+#| label: evolucion
+#| fig-cap: "Promedio de cuatro características de audio por década de lanzamiento."
+evol = df[df["anio"] >= 1960].groupby("decada")[["energy", "acousticness", "danceability", "valence"]].mean()
+etiquetas = {"energy": "Energía", "acousticness": "Acústica", "danceability": "Bailabilidad", "valence": "Positividad"}
+colores = [AZUL, NARANJA, "#1baf7a", "#eda100"]
+fig, ax = plt.subplots()
+for (v, et), c in zip(etiquetas.items(), colores):
+    ax.plot(evol.index, evol[v], marker="o", lw=2, color=c, label=et)
+ax.set(ylim=(0, 1), ylabel="Promedio (0-1)", xlabel="Década", title="Evolución del sonido por década")
+ax.legend(loc="upper left", ncol=4, frameon=False, fontsize=9)
+plt.show()
+
+texto(f"De los 60s a los 2010s la **acústica cae** de {fmt(evol['acousticness'].iloc[0])} a "
+      f"{fmt(evol['acousticness'].loc['2010s'])} y la **energía sube** de {fmt(evol['energy'].iloc[0])} a "
+      f"{fmt(evol['energy'].loc['2010s'])}. La positividad (valence) baja de {fmt(evol['valence'].iloc[0])} a "
+      f"{fmt(evol['valence'].loc['2010s'])}: la música reciente de la base es más intensa y producida, "
+      "pero menos alegre.")
+```
+
+---
+
+## Parte E: Clustering con K-Means
+
+**Pregunta:** si se ignora la etiqueta de género, ¿las canciones forman grupos naturales según su sonido?
+
+Se usan las 10 variables de audio (con duración, volumen y tempo winsorizados), estandarizadas con `StandardScaler` para que todas pesen lo mismo en la distancia.
+
+### E.1 Elección del número de clusters
+
+```{python}
+#| label: elegir-k
+#| fig-cap: "Método del codo (inercia) y coeficiente de silueta para k = 2 a 10."
+vars_cluster = ["danceability", "energy", "loudness_w", "speechiness", "acousticness",
+                "instrumentalness", "liveness", "valence", "tempo_w", "duracion_min_w"]
+X_cluster = StandardScaler().fit_transform(df[vars_cluster])
+
+rng = np.random.default_rng(SEMILLA)
+muestra = rng.choice(len(X_cluster), size=6000, replace=False)  # la silueta es O(n²)
+ks = range(2, 11)
+inercias, siluetas = [], []
+for k in ks:
+    km = KMeans(n_clusters=k, n_init=10, random_state=SEMILLA).fit(X_cluster)
+    inercias.append(km.inertia_)
+    siluetas.append(silhouette_score(X_cluster[muestra], km.labels_[muestra]))
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 3.8))
+ax1.plot(list(ks), inercias, marker="o", color=AZUL, lw=2)
+ax1.set(title="Método del codo", xlabel="k", ylabel="Inercia")
+ax2.plot(list(ks), siluetas, marker="o", color=NARANJA, lw=2)
+ax2.set(title="Coeficiente de silueta", xlabel="k", ylabel="Silueta")
+plt.tight_layout()
+plt.show()
+tabla(pd.DataFrame({"k": [str(k) for k in ks], "Inercia": inercias, "Silueta": siluetas}), 3)
+```
+
+```{python}
+#| label: k-final
+K = 4
+km = KMeans(n_clusters=K, n_init=20, random_state=SEMILLA).fit(X_cluster)
+df["cluster"] = km.labels_
+```
+
+**¿Por qué k = 4?** El coeficiente de silueta más alto es el de k = 2, pero dos grupos solo separan las canciones acústicas del resto y no dicen mucho. De k = 4 en adelante la silueta se queda prácticamente igual (alrededor de 0.13) y la curva de inercia ya no muestra un quiebre claro, así que agregar más clusters complica la interpretación sin mejorar la separación. Con k = 4 los grupos son claros de interpretar.
+
+Hay que ser honestos con el resultado: una silueta de 0.13 es **baja**. Significa que los clusters se traslapan bastante; la música no viene en grupos perfectamente separados, sino que es un continuo. Los clusters son útiles para describir "tipos de sonido", no como categorías rígidas.
+
+### E.2 Perfil de cada cluster
+
+```{python}
+#| label: perfil-cluster
+#| fig-cap: "Promedio de cada variable por cluster, en puntaje z."
+perfil_c = df.groupby("cluster")[AUDIO].mean()
+perfil_cz = (perfil_c - df[AUDIO].mean()) / df[AUDIO].std()
+fig, ax = plt.subplots(figsize=(10, 3.6))
+sns.heatmap(perfil_cz.rename(columns=nombres), cmap="RdBu_r", center=0, vmin=-1.5, vmax=1.5,
+            annot=True, fmt=".2f", annot_kws={"size": 8}, linewidths=0.5, ax=ax,
+            cbar_kws={"label": "Puntaje z"})
+ax.set(xlabel="", ylabel="Cluster", title="Perfil de audio de cada cluster")
+ax.tick_params(axis="x", rotation=30)
+plt.show()
+tabla(df["cluster"].value_counts().sort_index().rename_axis("Cluster").reset_index(name="Canciones"), 0)
+```
+
+Para nombrar los clusters se usa su rasgo dominante (la regla se aplica sobre el perfil, así que no depende del número que K-Means le asigne a cada grupo):
+
+```{python}
+#| label: nombres-cluster
+pendientes = list(perfil_cz.index)
+nombres_cluster = {}
+for col, nombre in [("instrumentalness", "Electrónicos instrumentales"),
+                    ("acousticness", "Acústicos y tranquilos"),
+                    ("valence", "Bailables y alegres")]:
+    c = perfil_cz.loc[pendientes, col].idxmax()
+    nombres_cluster[c] = nombre
+    pendientes.remove(c)
+nombres_cluster[pendientes[0]] = "Intensos y enérgicos"
+df["nombre_cluster"] = df["cluster"].map(nombres_cluster)
+
+resumen_c = (df.groupby("nombre_cluster")
+               .agg(Canciones=("track_id", "size"),
+                    **{"Género principal": ("playlist_genre", lambda g: g.value_counts().index[0]),
+                       "% del género principal": ("playlist_genre", lambda g: g.value_counts(normalize=True).iloc[0] * 100),
+                       "Popularidad media": ("popularidad", "mean")})
+               .sort_values("Canciones", ascending=False).reset_index().rename(columns={"nombre_cluster": "Cluster"}))
+tabla(resumen_c, 1)
+```
+
+* **Bailables y alegres:** alta bailabilidad y positividad, algo de palabra hablada. Es el grupo más grande y mezcla rap, latin y R&B.
+* **Intensos y enérgicos:** mucha energía y volumen, poca bailabilidad, tempo más rápido. Reúne EDM, rock y pop "de festival".
+* **Acústicos y tranquilos:** acústica muy alta, energía y volumen bajos. Baladas, R&B lento y rock suave.
+* **Electrónicos instrumentales:** casi sin voz (instrumentalness muy alta) y canciones más largas. Es el cluster más "puro": está dominado por EDM.
+
+### E.3 Clusters vs. géneros
+
+```{python}
+#| label: cluster-genero
+#| fig-cap: "Composición de cada cluster por género (% de las canciones del cluster)."
+cruce = pd.crosstab(df["nombre_cluster"], df["playlist_genre"], normalize="index")[GENEROS] * 100
+fig, ax = plt.subplots(figsize=(10, 3.8))
+izquierda = np.zeros(len(cruce))
+for g in GENEROS:
+    ax.barh(cruce.index, cruce[g], left=izquierda, color=COLORES_GENERO[g], label=g,
+            edgecolor="white", linewidth=1.5, height=0.65)
+    for i, (val, base) in enumerate(zip(cruce[g], izquierda)):
+        if val >= 8:
+            ax.text(base + val / 2, i, f"{val:.0f}%", ha="center", va="center", fontsize=8, color="white")
+    izquierda += cruce[g].values
+ax.set(xlabel="% de canciones del cluster", xlim=(0, 100), title="¿Qué géneros caen en cada cluster?")
+ax.legend(ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.18), frameon=False)
+ax.invert_yaxis()
+plt.show()
+```
+
+```{python}
+#| label: pca
+#| fig-cap: "Proyección de las canciones en los dos primeros componentes principales, coloreadas por cluster (muestra de 4,000)."
+pca = PCA(n_components=2, random_state=SEMILLA)
+coords = pca.fit_transform(X_cluster)
+var_exp = pca.explained_variance_ratio_.sum() * 100
+colores_cluster = [AZUL, NARANJA, "#1baf7a", "#6250d6", "#e34948", "#eda100"]
+idx = rng.choice(len(coords), 4000, replace=False)
+fig, ax = plt.subplots(figsize=(8, 5.5))
+for c in range(K):
+    sel = idx[df["cluster"].values[idx] == c]
+    ax.scatter(coords[sel, 0], coords[sel, 1], s=9, alpha=0.55, color=colores_cluster[c],
+               label=nombres_cluster[c], edgecolors="none")
+ax.set(xlabel="Componente principal 1", ylabel="Componente principal 2",
+       title=f"Clusters en 2 dimensiones (PCA, {var_exp:.0f}% de la varianza)")
+ax.legend(frameon=False, fontsize=9, markerscale=2)
+plt.show()
+```
+
+```{python}
+#| label: cluster-conclusion
+edm_inst = cruce.loc["Electrónicos instrumentales", "edm"]
+texto(f"**Conclusión del clustering:** K-Means encuentra tipos de sonido que **no coinciden uno a uno con los "
+      f"géneros**. Solo el cluster *Electrónicos instrumentales* tiene un género claramente dominante (EDM, "
+      f"{fmt(edm_inst, 0)} %); los demás mezclan varios géneros. Esto muestra que el género de una playlist es "
+      "una etiqueta cultural y comercial, no solo acústica: una canción de pop y una de latin pueden sonar muy "
+      "parecido. El PCA lo confirma: los grupos se ven como zonas de una sola nube y no como islas separadas.")
+```
+
+---
+
+## Parte F: Clasificación del género con aprendizaje supervisado
+
+**Pregunta:** ¿se puede predecir el género de la playlist (6 clases) a partir de las características de audio y el año de lanzamiento?
+
+### F.1 Preparación
+
+```{python}
+#| label: prep-clasificacion
+features = ["danceability", "energy", "key", "loudness", "mode", "speechiness", "acousticness",
+            "instrumentalness", "liveness", "valence", "tempo", "duracion_min", "anio"]
+X = df[features]
+y = df["playlist_genre"]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, stratify=y, random_state=SEMILLA)
+texto(f"Se dividió la base en **entrenamiento ({fmt(len(X_train), 0)} canciones, 70 %)** y "
+      f"**prueba ({fmt(len(X_test), 0)}, 30 %)**, estratificando por género para mantener las proporciones. "
+      f"Se usan {len(features)} variables predictoras. Como hay 6 géneros balanceados, un modelo que "
+      f"adivinara al azar acertaría cerca del {fmt(100 / 6, 1)} %.")
+```
+
+### F.2 Comparación de modelos
+
+Se entrenan los cuatro clasificadores vistos en clase y un quinto de *boosting*:
+
+```{python}
+#| label: modelos
+modelos = {
+    "Regresión logística": make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)),
+    "Naive Bayes": GaussianNB(),
+    "Árbol de decisión": DecisionTreeClassifier(max_depth=10, min_samples_leaf=20, random_state=SEMILLA),
+    "Random Forest": RandomForestClassifier(n_estimators=400, min_samples_leaf=2, n_jobs=-1, random_state=SEMILLA),
+    "Gradient Boosting": HistGradientBoostingClassifier(max_iter=400, learning_rate=0.06, random_state=SEMILLA),
+}
+resultados, probas = [], {}
+for nombre, modelo in modelos.items():
+    modelo.fit(X_train, y_train)
+    pred = modelo.predict(X_test)
+    proba = modelo.predict_proba(X_test)
+    probas[nombre] = proba
+    resultados.append({
+        "Modelo": nombre,
+        "Exactitud (accuracy)": accuracy_score(y_test, pred),
+        "F1 macro": f1_score(y_test, pred, average="macro"),
+        "AUC (uno vs. resto)": roc_auc_score(y_test, proba, multi_class="ovr", average="macro"),
+    })
+resultados = pd.DataFrame(resultados).sort_values("F1 macro", ascending=False).reset_index(drop=True)
+tabla(resultados, 3)
+mejor = resultados.loc[0, "Modelo"]
+texto(f"El mejor modelo es **{mejor}**, con exactitud de {fmt(resultados.loc[0, 'Exactitud (accuracy)'] * 100, 1)} % "
+      f"y AUC promedio de {fmt(resultados.loc[0, 'AUC (uno vs. resto)'], 3)}, es decir, unas "
+      f"{fmt(resultados.loc[0, 'Exactitud (accuracy)'] / (1 / 6), 1)} veces mejor que adivinar al azar.")
+```
+
+### F.3 Curvas ROC del mejor modelo
+
+Como el problema tiene 6 clases, se calcula una curva ROC por género con la estrategia **uno contra el resto** (*One-vs-Rest*), igual que en la clase de clasificación multiclase, más la curva micro-promediada.
+
+```{python}
+#| label: roc
+#| fig-cap: "Curvas ROC uno-contra-resto del mejor modelo."
+clases = modelos[mejor].classes_
+y_test_bin = label_binarize(y_test, classes=clases)
+proba = probas[mejor]
+fig, ax = plt.subplots(figsize=(7.5, 6))
+auc_genero = {}
+for i, g in enumerate(clases):
+    fpr, tpr, _ = roc_curve(y_test_bin[:, i], proba[:, i])
+    auc_genero[g] = auc(fpr, tpr)
+    ax.plot(fpr, tpr, lw=2, color=COLORES_GENERO[g], label=f"{g} (AUC = {auc_genero[g]:.3f})")
+fpr_mi, tpr_mi, _ = roc_curve(y_test_bin.ravel(), proba.ravel())
+ax.plot(fpr_mi, tpr_mi, lw=2, ls="--", color="#0b0b0b", label=f"micro-promedio (AUC = {auc(fpr_mi, tpr_mi):.3f})")
+ax.plot([0, 1], [0, 1], ls=":", color=GRIS, lw=1)
+ax.set(xlabel="Tasa de falsos positivos", ylabel="Tasa de verdaderos positivos",
+       title=f"Curvas ROC: {mejor}", xlim=(0, 1), ylim=(0, 1.02))
+ax.legend(loc="lower right", frameon=False, fontsize=9)
+plt.show()
+```
+
+### F.4 Matriz de confusión y métricas por género
+
+```{python}
+#| label: confusion
+#| fig-cap: "Matriz de confusión normalizada por fila: de las canciones de cada género real, qué % se predijo como cada género."
+pred_mejor = modelos[mejor].predict(X_test)
+cm = confusion_matrix(y_test, pred_mejor, labels=clases, normalize="true") * 100
+fig, ax = plt.subplots(figsize=(7, 5.5))
+sns.heatmap(cm, annot=True, fmt=".0f", cmap="Blues", xticklabels=clases, yticklabels=clases,
+            cbar_kws={"label": "% de la fila"}, linewidths=0.5, ax=ax)
+ax.set(xlabel="Género predicho", ylabel="Género real", title="Matriz de confusión (%)")
+plt.show()
+
+reporte = pd.DataFrame(classification_report(y_test, pred_mejor, output_dict=True)).T.loc[list(clases)]
+reporte["support"] = reporte["support"].astype(int)
+reporte = reporte.rename(columns={"precision": "Precisión", "recall": "Sensibilidad (recall)",
+                                  "f1-score": "F1", "support": "Canciones"}).reset_index(names="Género")
+tabla(reporte, 3)
+```
+
+```{python}
+#| label: confusion-texto
+cm_sin_diag = cm.copy()
+np.fill_diagonal(cm_sin_diag, 0)  # solo interesan los errores
+cm_df = pd.DataFrame(cm_sin_diag, index=clases, columns=clases)
+confusion_max = cm_df.stack().sort_values(ascending=False)
+(g1, g2), pct = confusion_max.index[0], confusion_max.iloc[0]
+(g3, g4), pct2 = confusion_max.index[1], confusion_max.iloc[1]
+mejor_g = reporte.sort_values("F1", ascending=False).iloc[0]
+peor_g = reporte.sort_values("F1").iloc[0]
+texto(f"El género más fácil de reconocer es **{mejor_g['Género']}** (F1 = {fmt(mejor_g['F1'], 3)}) y el más difícil "
+      f"es **{peor_g['Género']}** (F1 = {fmt(peor_g['F1'], 3)}). La confusión más frecuente es que el "
+      f"{fmt(pct, 0)} % de las canciones de **{g1}** se clasifican como **{g2}**, seguida de "
+      f"**{g3} → {g4}** ({fmt(pct2, 0)} %). Tiene sentido musical: son géneros que comparten ritmo, "
+      "producción y muchas veces artistas.")
+```
+
+### F.5 ¿Qué variables usa más el modelo?
+
+```{python}
+#| label: importancia
+#| fig-cap: "Importancia por permutación: cuánto cae la exactitud del modelo si se desordena cada variable."
+imp = permutation_importance(modelos[mejor], X_test, y_test, n_repeats=5, random_state=SEMILLA, n_jobs=-1)
+imp_df = (pd.DataFrame({"Variable": features, "Importancia": imp.importances_mean, "Desv": imp.importances_std})
+          .sort_values("Importancia"))
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.barh(imp_df["Variable"], imp_df["Importancia"] * 100, xerr=imp_df["Desv"] * 100,
+        color=AZUL, height=0.65, error_kw={"ecolor": GRIS, "lw": 1})
+ax.set(xlabel="Caída en exactitud (puntos porcentuales)", title=f"Importancia de variables: {mejor}")
+plt.show()
+top3 = imp_df.sort_values("Importancia", ascending=False)["Variable"].head(3).tolist()
+bottom2 = imp_df["Variable"].head(2).tolist()
+texto(f"Las tres variables que más pesan son **{top3[0]}**, **{top3[1]}** y **{top3[2]}**. "
+      f"Las que menos aportan son **{bottom2[0]}** y **{bottom2[1]}**. El año pesa tanto porque los géneros "
+      "tienen épocas distintas (el rock de la base es mucho más antiguo que el EDM o el latin).")
+```
+
+---
+
+## Parte G: Exportación para R y Power BI
+
+```{python}
+#| label: exportar
+import os
+os.makedirs("powerbi", exist_ok=True)
+
+nombres_genero = {"edm": "EDM", "latin": "Latin", "pop": "Pop", "r&b": "R&B", "rap": "Rap", "rock": "Rock"}
+limpio = df[["track_id", "track_name", "track_artist", "track_album_name", "playlist_name",
+             "playlist_genre", "playlist_subgenre", "track_popularity", "popularidad", "nivel_popularidad",
+             "anio", "decada", "danceability", "energy", "key", "loudness", "mode", "modo", "speechiness",
+             "acousticness", "instrumentalness", "liveness", "valence", "tempo", "duracion_min",
+             "cluster", "nombre_cluster"]].copy()
+limpio["genero"] = limpio["playlist_genre"].map(nombres_genero)
+limpio.to_csv("data/spotify_limpio.csv", index=False)
+
+# Tabla para Power BI: incluye la predicción del mejor modelo en el conjunto de prueba
+pbi = limpio.copy()
+pbi["en_prueba"] = pbi.index.isin(X_test.index)
+pbi["genero_predicho"] = pd.Series(pred_mejor, index=X_test.index).map(nombres_genero)
+pbi["prediccion_correcta"] = np.where(pbi["en_prueba"], (pbi["genero"] == pbi["genero_predicho"]).astype(int), np.nan)
+pbi["prediccion_correcta"] = pbi["prediccion_correcta"].astype("Int64")   # 1 = acierto, 0 = error, vacío = no está en prueba
+pbi = pbi.round(4)
+pbi.to_csv("powerbi/spotify_powerbi.csv", index=False, encoding="utf-8-sig")
+resultados.round(4).assign(Herramienta="Python", Tarea="Clasificación de género").to_csv(
+    "powerbi/resultados_clasificacion.csv", index=False, encoding="utf-8-sig")
+perfil.round(4).rename(index=nombres_genero).reset_index(names="genero").to_csv(
+    "powerbi/perfil_generos.csv", index=False, encoding="utf-8-sig")
+
+archivos = pd.DataFrame({
+    "Archivo": ["data/spotify_limpio.csv", "powerbi/spotify_powerbi.csv",
+                "powerbi/resultados_clasificacion.csv", "powerbi/perfil_generos.csv"],
+    "Filas": [len(limpio), len(pbi), len(resultados), len(perfil)],
+    "Uso": ["Entrada de la Parte 2 (R)", "Tabla principal del dashboard",
+            "Comparación de modelos en el dashboard", "Perfil de audio por género"],
+})
+tabla(archivos, 0)
+```
+
+---
+
+## Conclusiones
+
+```{python}
+#| label: conclusiones
+mejor_fila = resultados.iloc[0]
+texto(f"""
+1. **La base necesitaba limpieza aunque no tuviera nulos en las variables de audio.** De {fmt(filas, 0)} filas quedaron
+   **{fmt(len(df), 0)} canciones únicas**: se eliminaron {fmt(filas - len(df), 0)} filas (nulos de texto y canciones
+   repetidas entre playlists o publicadas dos veces). Además, {fmt(n0, 0)} canciones con popularidad 0 resultaron ser
+   un **nulo disfrazado**. Se compararon tres formas de imputarlas y se decidió excluirlas de los modelos de popularidad.
+
+2. **Los géneros tienen firmas de audio reconocibles.** El rap se distingue por la palabra hablada, el EDM por lo
+   instrumental y enérgico, el R&B por lo acústico y tranquilo, el latin por la positividad y el rock por ser
+   poco bailable y más antiguo. El pop es el género "promedio": no destaca en ninguna variable.
+
+3. **El sonido cambió con el tiempo:** la música reciente de la base es más enérgica y menos acústica, y también
+   menos alegre que la de los 60s-80s.
+
+4. **El clustering encontró 4 tipos de sonido** (bailables y alegres, intensos y enérgicos, acústicos y tranquilos,
+   electrónicos instrumentales) que **no coinciden con los géneros**, y su silueta baja (≈ 0.13) muestra que la
+   música es un continuo más que grupos separados.
+
+5. **Sí se puede predecir el género con el audio, aunque no perfectamente.** El mejor modelo ({mejor_fila['Modelo']})
+   acierta el {fmt(mejor_fila['Exactitud (accuracy)'] * 100, 1)} % de las veces (contra 16.7 % al azar) con un AUC
+   de {fmt(mejor_fila['AUC (uno vs. resto)'], 3)}. Los modelos de ensamble (Gradient Boosting y Random Forest)
+   superan claramente a los modelos simples. Rock, EDM y rap se reconocen bien; pop, latin y R&B se confunden
+   entre sí porque comparten producción y artistas.
+
+6. **La popularidad casi no se relaciona con el sonido** (ninguna correlación pasa de |r| = 0.15). La Parte 2, en R,
+   analiza esta pregunta con pruebas de hipótesis y modelos de regresión.
+
+**Limitaciones:** el género viene de la playlist, no de la canción, y una canción puede estar en playlists de
+varios géneros. La popularidad es una foto de enero de 2020 y la base sobre-representa música reciente, así que los
+resultados describen esta muestra de Spotify y no toda la música.
+""")
+```
