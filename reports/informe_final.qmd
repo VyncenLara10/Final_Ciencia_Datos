@@ -1,0 +1,109 @@
+---
+title: "Análisis de 30,000 canciones de Spotify"
+subtitle: "Informe reproducible del proyecto final de Ciencia de Datos"
+author:
+  - "Vyncen Lara"
+  - "Roger Monterroso"
+  - "Juan Marcos"
+  - "Jose Ronquillo"
+date: "2026-11-09"
+lang: es
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  echo: true
+engine: knitr
+---
+
+# Resumen ejecutivo
+
+Se analizan canciones de Spotify provenientes del conjunto público **30,000 Spotify Songs** de TidyTuesday. El objetivo es evaluar cuánto informan las propiedades de audio sobre la etiqueta de género de la playlist y sobre la popularidad histórica. El repositorio contiene 32,833 registros originales y 26,229 canciones tras la limpieza documentada. Los análisis originales comparan modelos predictivos y muestran una exactitud cercana al 58.7 % para la clasificación de género y un R² cercano a 0.16 para popularidad; los resultados aquí se acompañan de verificaciones ejecutables, no se vuelven a entrenar en este informe resumido.
+
+# Problema y preguntas
+
+1. ¿Cómo se distribuyen las canciones por género de playlist y popularidad?
+2. ¿Qué variables de audio cambian entre los géneros?
+3. ¿Qué tan bien clasifican los modelos existentes el género?
+4. ¿Qué proporción de la variación de la popularidad explican los modelos?
+
+# Fuente, alcance y ética
+
+Fuente: [TidyTuesday, 21 de enero de 2020](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-01-21). Los datos fueron compartidos con fines de análisis educativo y proceden de Spotify mediante `spotifyr`; consultar las condiciones vigentes de TidyTuesday, Spotify y los datos antes de redistribuirlos. No se incluyen identificadores privados de usuarios. Cada registro original describe la presencia de una canción en una playlist; no debe confundirse el género de la playlist con la verdadera etiqueta individual de la canción. La popularidad no es una medida causal ni actual.
+
+# Metodología y calidad de los datos
+
+El análisis original en Python elimina registros sin nombre o artista, ordena por popularidad y deduplica por identificador y por nombre-artista; además produce variables de año, década y duración y clusters. En R se comprueba la consistencia de la depuración y se estudian asociaciones y modelos de popularidad. La decisión original de tratar la popularidad igual a 0 como faltante es una **suposición analítica**, no una regla garantizada de Spotify: debe reconocerse como limitación y sería importante evaluar sensibilidad incluyendo esos ceros.
+
+```{r}
+#| label: r-carga-resumen
+#| echo: true
+ruta <- if (file.exists("../data/spotify_limpio.csv")) "../data/spotify_limpio.csv" else "data/spotify_limpio.csv"
+datos <- read.csv(ruta, fileEncoding="UTF-8-BOM", check.names=FALSE)
+cat("Canciones:", nrow(datos), "\nColumnas:", ncol(datos), "\n")
+genero <- if ("genero" %in% names(datos)) "genero" else "playlist_genre"
+print(sort(table(datos[[genero]]), decreasing=TRUE))
+```
+
+# Análisis integrado con Python
+
+Se utiliza **Python** para obtener estadísticas descriptivas y correlaciones de las variables de audio sobre la misma tabla que utilizó R. El código es ejecutado por Quarto mediante `reticulate` y el motor `knitr` (ambos deben estar instalados).
+
+```{python}
+#| label: python-estadisticas
+import pandas as pd
+from pathlib import Path
+p = Path("../data/spotify_limpio.csv")
+if not p.exists():
+    p = Path("data/spotify_limpio.csv")
+df = pd.read_csv(p)
+cols = [c for c in ["danceability","energy","valence","acousticness","speechiness","tempo"] if c in df.columns]
+print(df[cols].describe().round(3).to_string())
+print("\nCorrelaciones de audio:\n", df[cols].corr(numeric_only=True).round(2).to_string())
+```
+
+# Inferencia estadística en R
+
+Comparación descriptiva por género; no debe interpretarse como un efecto causal ni extenderse automáticamente a todas las canciones de Spotify.
+
+```{r}
+#| label: r-estadisticas
+if (all(c("energy","danceability") %in% names(datos))) {
+  print(aggregate(datos[c("energy","danceability")], list(genero=datos[[genero]]),
+                  mean, na.rm=TRUE))
+  boxplot(energy ~ datos[[genero]], data=datos, col="lightgreen",
+          xlab="Género de playlist", ylab="Energía", main="Energía por género")
+  prueba <- kruskal.test(datos$energy, as.factor(datos[[genero]]))
+  print(prueba)
+}
+```
+
+# Modelado y evaluación
+
+Los siguientes resultados están almacenados por los trabajos originales y se leen directamente, garantizando que el resumen coincida con los artefactos versionados. Para el entrenamiento, separación, curvas ROC y detalles de cada modelo, revisar `01_analisis_python.qmd` y `02_analisis_r.Rmd`.
+
+```{r}
+#| label: tablas-modelos
+base <- if (file.exists("../powerbi")) "../powerbi" else "powerbi"
+clasif <- read.csv(file.path(base,"resultados_clasificacion.csv"),check.names=FALSE,fileEncoding="UTF-8-BOM")
+pop <- read.csv(file.path(base,"resultados_popularidad.csv"),check.names=FALSE,fileEncoding="UTF-8-BOM")
+knitr::kable(clasif,caption="Clasificación del género (Python)",digits=3)
+knitr::kable(pop,caption="Modelos de popularidad (R)",digits=3)
+```
+
+# Dashboard
+
+El dashboard equivalente a Power BI se implementa mediante Streamlit en `dashboard/app.py` y permite filtrar género, año, popularidad y clusters cuando estén disponibles, explorar distribuciones y características de audio, comparar modelos y descargar datos filtrados.
+
+# Discusión y conclusiones
+
+Las características musicales sirven para **describir y distinguir parcialmente géneros**; la exactitud predictiva está por encima de una elección aleatoria entre seis clases, pero no elimina confusiones entre categorías. Para **popularidad**, el mejor R² reportado está alrededor de 0.16, de modo que la mayor parte de la variación queda fuera del modelo. Estos resultados describen la muestra histórica, no prueban relaciones causales. La composición de playlists, la deduplicación y la interpretación de popularidad cero limitan la generalización.
+
+# Reproducción y referencias
+
+Instrucciones completas en `README.md`. Fuente primaria: [TidyTuesday (2020-01-21)](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-01-21). Las implementaciones de referencia y sus HTML están en la raíz del repositorio.

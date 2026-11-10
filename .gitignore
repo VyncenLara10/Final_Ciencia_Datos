@@ -1,0 +1,9 @@
+.venv/
+.Rproj.user/
+__pycache__/
+.ipynb_checkpoints/
+.quarto/
+*_files/
+*.Rhistory
+*.RData
+.DS_Store
